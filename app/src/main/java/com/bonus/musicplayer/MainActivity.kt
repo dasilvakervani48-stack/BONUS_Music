@@ -128,6 +128,11 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.layout.aspectRatio
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.runtime.LaunchedEffect
+import android.os.Handler
+import android.os.Looper
+import androidx.lifecycle.compose.LifecycleResumeEffect
+import androidx.compose.runtime.DisposableEffect
 
 
 val OneUISansFamily = FontFamily(
@@ -235,26 +240,57 @@ fun loadMusicTracks(context: Context): List<MusicTrack> {
                 MusicTrack(
                     id = cursor.getLong(idColumn),
 
-                    title = cursor.getString(titleColumn)
-                        ?: "Titre inconnu",
+                    title =
+                        cursor.getString(titleColumn)
+                            ?.takeUnless {
+                                it == "<unknown>" ||
+                                        it.isBlank()
+                            }
+                            ?: "Titre inconnu",
 
-                    artist = cursor.getString(artistColumn)
-                        ?: "Artiste inconnu",
+                    artist =
+                        cursor.getString(artistColumn)
+                            ?.takeUnless {
+                                it == "<unknown>" ||
+                                        it.isBlank()
+                            }
+                            ?: "Artiste inconnu",
 
-                    album = cursor.getString(albumColumn)
-                        ?: "Album inconnu",
+                    album =
+                        cursor.getString(albumColumn)
+                            ?.takeUnless {
+                                it == "<unknown>" ||
+                                        it.isBlank()
+                            }
+                            ?: "Album inconnu",
 
-                    albumId = cursor.getLong(albumIdColumn),
+                    albumId =
+                        cursor.getLong(albumIdColumn),
 
-                    trackNumber = (
-                            cursor.getInt(trackNumberColumn) % 100
-                            ),
-                    genre = cursor.getString(genreColumn)
-                        ?: "Genre inconnu",
-                    composer = cursor.getString(composerColumn)
-                        ?: "Producteur inconnu",
-                    path = cursor.getString(pathColumn),
-                    duration = cursor.getLong(durationColumn)
+                    trackNumber =
+                        cursor.getInt(trackNumberColumn) % 100,
+
+                    genre =
+                        cursor.getString(genreColumn)
+                            ?.takeUnless {
+                                it == "<unknown>" ||
+                                        it.isBlank()
+                            }
+                            ?: "Genre inconnu",
+
+                    composer =
+                        cursor.getString(composerColumn)
+                            ?.takeUnless {
+                                it == "<unknown>" ||
+                                        it.isBlank()
+                            }
+                            ?: "Producteur inconnu",
+
+                    path =
+                        cursor.getString(pathColumn),
+
+                    duration =
+                        cursor.getLong(durationColumn)
                 )
             )
         }
@@ -301,7 +337,7 @@ fun loadAlbumArt(
 
 class MainActivity : ComponentActivity() {
 
-    lateinit var player: ExoPlayer
+
     private var mediaController by mutableStateOf<MediaController?>(null)
     val playbackPlayer: Player
         get() = mediaController
@@ -310,11 +346,6 @@ class MainActivity : ComponentActivity() {
 
 
     override fun onDestroy() {
-
-        if (::player.isInitialized) {
-            player.release()
-        }
-
         super.onDestroy()
     }
 
@@ -330,6 +361,31 @@ class MainActivity : ComponentActivity() {
                 track.id
             )
             .apply()
+    }
+    private fun saveCurrentPlayingTrack() {
+
+        val mediaItem =
+            mediaController?.currentMediaItem
+                ?: return
+
+        val uri =
+            mediaItem.localConfiguration?.uri
+                ?: return
+
+        val trackId =
+            uri.lastPathSegment?.toLongOrNull()
+                ?: return
+
+        val tracks =
+            loadMusicTracks(this)
+
+        val track =
+            tracks.firstOrNull {
+                it.id == trackId
+            }
+                ?: return
+
+        saveLastPlayedTrack(track)
     }
 
     private fun loadLastPlayedTrack(): MusicTrack? {
@@ -356,6 +412,57 @@ class MainActivity : ComponentActivity() {
         return tracks.firstOrNull {
             it.id == trackId
         }
+    }
+    private fun startListenTimer() {
+
+        cancelListenTimer()
+
+        val mediaItem =
+            mediaController?.currentMediaItem
+                ?: return
+
+        val uri =
+            mediaItem.localConfiguration
+                ?.uri
+                ?: return
+
+        val trackId =
+            uri.lastPathSegment
+                ?.toLongOrNull()
+                ?: return
+
+        if (countedTrackId == trackId) {
+            return
+        }
+
+        val runnable =
+            Runnable {
+
+                ListeningStatsManager(
+                    this
+                ).registerListen(
+                    trackId
+                )
+
+                countedTrackId =
+                    trackId
+            }
+
+        pendingListenRunnable =
+            runnable
+
+        listenHandler.postDelayed(
+            runnable,
+            30_000L
+        )
+    }
+    private fun cancelListenTimer() {
+
+        pendingListenRunnable?.let {
+            listenHandler.removeCallbacks(it)
+        }
+
+        pendingListenRunnable = null
     }
 
 
@@ -396,6 +503,12 @@ class MainActivity : ComponentActivity() {
 
         }
     }
+    private val listenHandler =
+        Handler(Looper.getMainLooper())
+
+    private var pendingListenRunnable: Runnable? = null
+
+    private var countedTrackId: Long? = null
 
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -404,7 +517,6 @@ class MainActivity : ComponentActivity() {
 
         scanAudioFiles()
 
-        player = ExoPlayer.Builder(this).build()
         val sessionToken = SessionToken(
             this,
             ComponentName(
@@ -424,40 +536,70 @@ class MainActivity : ComponentActivity() {
 
         controllerFuture.addListener(
             {
+
                 mediaController = controllerFuture.get()
 
+                mediaController?.addListener(
+                    object : Player.Listener {
+
+                        override fun onIsPlayingChanged(
+                            isPlaying: Boolean
+                        ) {
+                            if (isPlaying) {
+                                startListenTimer()
+                            } else {
+                                cancelListenTimer()
+                            }
+                        }
+                    }
+                )
+
+                // 👇 RESTAURATION DE LA DERNIÈRE MUSIQUE
                 val lastTrack = loadLastPlayedTrack()
 
                 if (lastTrack != null) {
 
-                    val mediaUri =
-                        ContentUris.withAppendedId(
-                            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-                            lastTrack.id
+                    val tracks = loadMusicTracks(this)
+
+                    val startIndex = tracks.indexOfFirst {
+                        it.id == lastTrack.id
+                    }
+
+                    if (startIndex >= 0) {
+
+                        val mediaItems = tracks.map { track ->
+
+                            val mediaUri =
+                                ContentUris.withAppendedId(
+                                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                                    track.id
+                                )
+
+                            MediaItem.fromUri(mediaUri)
+                        }
+
+                        val preferences =
+                            getSharedPreferences(
+                                "BONUS_Music",
+                                Context.MODE_PRIVATE
+                            )
+
+                        val lastPosition =
+                            preferences.getLong(
+                                "lastPlayedPosition",
+                                0L
+                            )
+
+                        mediaController?.setMediaItems(
+                            mediaItems,
+                            startIndex,
+                            lastPosition
                         )
 
-                    val mediaItem =
-                        MediaItem.fromUri(mediaUri)
-
-                    mediaController?.setMediaItem(mediaItem)
-                    mediaController?.prepare()
-
-                    val preferences =
-                        getSharedPreferences(
-                            "BONUS_Music",
-                            Context.MODE_PRIVATE
-                        )
-
-                    val lastPosition =
-                        preferences.getLong(
-                            "lastPlayedPosition",
-                            0L
-                        )
-
-                    if (lastPosition > 0L) {
-                        mediaController?.seekTo(lastPosition)
+                        mediaController?.prepare()
                     }
                 }
+
             },
             ContextCompat.getMainExecutor(this)
         )
@@ -535,6 +677,50 @@ class MainActivity : ComponentActivity() {
 
                 var selectedTrack by remember {
                     mutableStateOf<MusicTrack?>(null)
+                }
+                DisposableEffect(mediaController) {
+                    val controller = mediaController
+
+                    if (controller == null) {
+                        onDispose { }
+                    } else {
+
+                        val listener = object : Player.Listener {
+
+                            override fun onMediaItemTransition(
+                                mediaItem: MediaItem?,
+                                reason: Int
+                            ) {
+                                val trackId = mediaItem
+                                    ?.localConfiguration
+                                    ?.uri
+                                    ?.lastPathSegment
+                                    ?.toLongOrNull()
+
+                                if (trackId != null) {
+
+                                    val tracks =
+                                        loadMusicTracks(this@MainActivity)
+
+                                    val newTrack =
+                                        tracks.firstOrNull {
+                                            it.id == trackId
+                                        }
+
+                                    if (newTrack != null) {
+                                        selectedTrack = newTrack
+                                        saveLastPlayedTrack(newTrack)
+                                    }
+                                }
+                            }
+                        }
+
+                        controller.addListener(listener)
+
+                        onDispose {
+                            controller.removeListener(listener)
+                        }
+                    }
                 }
                 LaunchedEffect(Unit) {
 
@@ -622,6 +808,7 @@ class MainActivity : ComponentActivity() {
                                         if (nextTrack != null) {
 
                                             selectedTrack = nextTrack
+                                            saveLastPlayedTrack(nextTrack)
 
                                             val mediaUri =
                                                 ContentUris.withAppendedId(
@@ -635,6 +822,7 @@ class MainActivity : ComponentActivity() {
                                             mediaController?.setMediaItem(
                                                 mediaItem
                                             )
+
                                             mediaController?.prepare()
                                             mediaController?.play()
                                         }
@@ -645,6 +833,7 @@ class MainActivity : ComponentActivity() {
                                         if (previousTrack != null) {
 
                                             selectedTrack = previousTrack
+                                            saveLastPlayedTrack(previousTrack)
 
                                             val mediaUri =
                                                 ContentUris.withAppendedId(
@@ -700,9 +889,9 @@ class MainActivity : ComponentActivity() {
                                             onItemSelected = {
                                                 selectedItem = it
                                             },
-                                            selectedTrack = selectedTrack,
-                                            player = player
+                                            selectedTrack = selectedTrack
                                         )
+
 
                                         1 -> SearchScreen(
                                             modifier = Modifier.padding(
@@ -1327,15 +1516,47 @@ class MainActivity : ComponentActivity() {
         selectedItem: Int,
         onItemSelected: (Int) -> Unit,
         selectedTrack: MusicTrack?,
-        player: ExoPlayer
     ) {
         var showMenu by remember {
             mutableStateOf(false)
         }
         val context = LocalContext.current
+        var availableUpdate by remember {
+            mutableStateOf<AppUpdate?>(null)
+        }
+
+        LaunchedEffect(Unit) {
+            availableUpdate = checkForUpdate(context)
+        }
 
         val tracks = remember {
             loadMusicTracks(context)
+        }
+        val listeningStatsManager =
+            remember {
+                ListeningStatsManager(context)
+            }
+
+        var weeklyTopTracks by remember {
+            mutableStateOf(
+                emptyList<MusicTrack>()
+            )
+        }
+
+        LaunchedEffect(tracks) {
+            weeklyTopTracks =
+                listeningStatsManager
+                    .getWeeklyTopTracks(tracks)
+        }
+
+        LifecycleResumeEffect(tracks) {
+
+            weeklyTopTracks =
+                listeningStatsManager
+                    .getWeeklyTopTracks(tracks)
+
+            onPauseOrDispose {
+            }
         }
 
         Box(
@@ -1422,6 +1643,102 @@ class MainActivity : ComponentActivity() {
                 Spacer(
                     modifier = Modifier.height(16.dp)
                 )
+                if (availableUpdate != null) {
+
+                    Card(
+                        modifier =
+                            Modifier.fillMaxWidth(),
+                        shape =
+                            RoundedCornerShape(28.dp),
+                        onClick = {
+
+                            val intent =
+                                Intent(
+                                    Intent.ACTION_VIEW,
+                                    Uri.parse(
+                                        availableUpdate!!.url
+                                    )
+                                )
+
+                            context.startActivity(intent)
+                        }
+                    ) {
+
+                        Column(
+                            modifier =
+                                Modifier.padding(24.dp)
+                        ) {
+
+                            Text(
+                                text =
+                                    "Mise à jour disponible pour BONUS Music",
+                                fontFamily =
+                                    OneUISansFamily,
+                                fontWeight =
+                                    FontWeight.Bold,
+                                fontSize =
+                                    22.sp
+                            )
+
+                            Spacer(
+                                modifier =
+                                    Modifier.height(8.dp)
+                            )
+
+                            Text(
+                                text =
+                                    "Une nouvelle version de BONUS Music est disponible.",
+                                fontFamily =
+                                    OneUISansFamily
+                            )
+
+                            Spacer(
+                                modifier =
+                                    Modifier.height(8.dp)
+                            )
+
+                            Text(
+                                text =
+                                    "Version ${availableUpdate!!.version}",
+                                fontFamily =
+                                    OneUISansFamily,
+                                fontWeight =
+                                    FontWeight.Bold
+                            )
+                            Spacer(
+                                modifier =
+                                    Modifier.height(16.dp)
+                            )
+                            Button(
+                                onClick = {
+
+                                    val intent =
+                                        Intent(
+                                            Intent.ACTION_VIEW,
+                                            Uri.parse(
+                                                availableUpdate!!.url
+                                            )
+                                        )
+
+                                    context.startActivity(intent)
+                                }
+                            ) {
+                                Text(
+                                    text = "Mettre à jour",
+                                    fontFamily =
+                                        OneUISansFamily,
+                                    fontWeight =
+                                        FontWeight.Normal
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(
+                        modifier =
+                            Modifier.height(15.dp)
+                    )
+                }
                 if (tracks.isEmpty()) {
 
                     Card(
@@ -1492,25 +1809,86 @@ class MainActivity : ComponentActivity() {
                     ) {
 
                         Text(
-                            text = "Les plus écoutés cette semaine",
+                            text =
+                                "Les plus écoutés cette semaine",
                             fontFamily =
                                 OneUISansFamily,
                             fontWeight =
                                 FontWeight.Bold,
-                            fontSize = 22.sp
+                            fontSize =
+                                22.sp
                         )
 
                         Spacer(
                             modifier =
-                                Modifier.height(8.dp)
+                                Modifier.height(16.dp)
                         )
 
-                        Text(
-                            text =
-                                "Vous n'avez rien écouté. Les titres les plus écoutés s'afficheront ici.",
-                            fontFamily =
-                                OneUISansFamily,
-                        )
+                        if (weeklyTopTracks.isEmpty()) {
+
+                            Text(
+                                text =
+                                    "Vous n'avez rien écouté. Les titres les plus écoutés s'afficheront ici.",
+                                fontFamily =
+                                    OneUISansFamily
+                            )
+
+                        } else {
+
+                            weeklyTopTracks
+                                .forEachIndexed { index, track ->
+
+                                    Row(
+                                        modifier =
+                                            Modifier
+                                                .fillMaxWidth()
+                                                .padding(
+                                                    vertical = 8.dp
+                                                ),
+                                        verticalAlignment =
+                                            Alignment.CenterVertically
+                                    ) {
+
+                                        Text(
+                                            text =
+                                                "${index + 1}",
+                                            modifier =
+                                                Modifier.width(32.dp),
+                                            fontFamily =
+                                                OneUISansFamily,
+                                            fontWeight =
+                                                FontWeight.Bold,
+                                            fontSize =
+                                                18.sp
+                                        )
+
+                                        Column(
+                                            modifier =
+                                                Modifier.weight(1f)
+                                        ) {
+
+                                            Text(
+                                                text =
+                                                    track.title,
+                                                fontFamily =
+                                                    OneUISansFamily,
+                                                fontWeight =
+                                                    FontWeight.Bold
+                                            )
+
+                                            Text(
+                                                text =
+                                                    track.artist,
+                                                fontFamily =
+                                                    OneUISansFamily,
+                                                fontSize =
+                                                    14.sp
+                                            )
+                                        }
+                                    }
+                                }
+
+                        }
                     }
                 }
             }
